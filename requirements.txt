@@ -1,0 +1,17 @@
+# Rover Vision System — Python dependencies
+# Install with: pip install -r requirements.txt
+
+ultralytics>=8.3.0       # YOLO11 + YOLO inference engine (auto-downloads weights)
+opencv-python>=4.9.0     # Camera capture + frame drawing
+numpy>=1.24.0            # Array ops (pulled in by ultralytics anyway)
+
+# ── Optional but recommended ──────────────────────────────────────────────────
+# For ONNX export (faster CPU inference on Pi):
+#   pip install onnxruntime
+#
+# For INT8 quantization (fastest on Pi 5 with NPU):
+#   pip install onnxruntime  openvino
+#
+# To export your model after download:
+#   python -c "from ultralytics import YOLO; YOLO('yolo11n.pt').export(format='onnx')"
+#   Then set MODEL_PATH = 'yolo11n.onnx' in rover_autonomy.py
