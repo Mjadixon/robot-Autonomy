@@ -21,6 +21,7 @@ import threading
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional, List, Tuple
+import math
 
 try:
     from ultralytics import YOLO
@@ -49,6 +50,18 @@ IOU_THRESHOLD     = 0.45
 DEVICE            = 'cpu'      # IMPORTANT: CPU for Raspberry Pi (no NVIDIA GPU)
 USE_FP16          = False       # Disable FP16 on RPi (no benefit on CPU, may cause issues)
 USE_INT8_QUANT    = True        # Enable INT8 quantization (~3-4x speedup, minimal accuracy loss)
+
+# Odometry / IMU config (tune to your robot)
+SERIAL_PORT = '/dev/ttyACM0'     # Arduino serial port (override with --serial)
+SERIAL_BAUD = 115200
+WHEEL_BASE_M = 0.18              # Distance between left/right wheels (meters)
+WHEEL_DIAMETER_M = 0.065         # Wheel diameter (meters)
+TICKS_PER_REV = 360              # Encoder ticks per wheel revolution
+METERS_PER_TICK = (math.pi * WHEEL_DIAMETER_M) / max(1, TICKS_PER_REV)
+
+# Fast stop params
+FAST_STOP_CONF = 0.35            # Immediate stop confidence threshold
+FAST_STOP_AREA_FRAC = 0.01       # Minimum area fraction to consider immediate stop
 
 # FPS Optimization for RPi (critical for smooth motion)
 INFERENCE_SKIP_FRAMES = 2       # Run inference every 2 frames (was 3) - more frequent for better detection
@@ -283,6 +296,194 @@ class DetectionTrackerManager:
         
         return confirmed
 
+
+# ─── AprilTag detection + simple EKF fusion (lightweight) ─────────────────────
+try:
+    import apriltag
+except Exception:
+    apriltag = None
+    print("[WARN] apriltag library not installed. AprilTag detection will be disabled. Install with: pip install apriltag")
+
+
+class AprilTagDetector:
+    def __init__(self, tag_size_m: float = 0.15, camera_matrix: Optional[np.ndarray] = None, dist_coeffs: Optional[np.ndarray] = None):
+        self.tag_size = tag_size_m
+        self.camera_matrix = camera_matrix
+        self.dist_coeffs = dist_coeffs if dist_coeffs is not None else np.zeros((4, 1))
+        if apriltag is not None:
+            try:
+                self.detector = apriltag.Detector()
+            except Exception:
+                self.detector = None
+        else:
+            self.detector = None
+
+    def detect(self, frame: np.ndarray) -> List[dict]:
+        """Detect AprilTags and return list of {'id', 'tvec', 'rvec', 'corners'}"""
+        if self.detector is None:
+            return []
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        dets = self.detector.detect(gray)
+        out = []
+        # 3D object points for tag corners (centered at tag center, z=0)
+        s = self.tag_size / 2.0
+        obj_pts = np.array([[-s, -s, 0], [ s, -s, 0], [ s,  s, 0], [-s,  s, 0]], dtype=np.float32)
+
+        for d in dets:
+            try:
+                corners = np.array(d.corners, dtype=np.float32)
+                # Solve PnP: object points -> image corners
+                success, rvec, tvec = cv2.solvePnP(obj_pts, corners, self.camera_matrix, self.dist_coeffs, flags=cv2.SOLVEPNP_IPPE_SQUARE)
+                if not success:
+                    continue
+                out.append({'id': int(d.tag_id), 'rvec': rvec, 'tvec': tvec, 'corners': corners})
+            except Exception:
+                continue
+        return out
+
+
+class SimpleEKFLocalizer:
+    """Very small EKF-like pose fusion for x,y,theta using tag absolute observations.
+    This is a lightweight correction step: state = [x, y, theta].
+    For full accuracy replace with a proper EKF using odometry/IMU prediction.
+    """
+    def __init__(self):
+        self.x = 0.0
+        self.y = 0.0
+        self.theta = 0.0
+        self.P = np.eye(3) * 1.0
+
+    def predict(self, dx=0.0, dy=0.0, dtheta=0.0, Q=None):
+        # Simple motion prediction (additive)
+        self.x += dx
+        self.y += dy
+        self.theta += dtheta
+        self.theta = (self.theta + math.pi) % (2 * math.pi) - math.pi
+        if Q is None:
+            Q = np.eye(3) * 0.01
+        self.P = self.P + Q
+
+    def update_with_absolute_pose(self, meas_x: float, meas_y: float, meas_theta: float, R=None):
+        # Measurement is absolute pose from an AprilTag observation (world coordinates)
+        if R is None:
+            R = np.eye(3) * 0.05
+
+        z = np.array([meas_x, meas_y, meas_theta])
+        xhat = np.array([self.x, self.y, self.theta])
+        y = z - xhat
+        # normalize angle
+        y[2] = (y[2] + math.pi) % (2 * math.pi) - math.pi
+
+        S = self.P + R
+        K = self.P @ np.linalg.inv(S)
+        xhat = xhat + K @ y
+        self.x, self.y, self.theta = xhat.tolist()
+        self.P = (np.eye(3) - K) @ self.P
+
+    def get_pose(self) -> Tuple[float, float, float]:
+        return (self.x, self.y, self.theta)
+
+
+class SerialTelemetry:
+    """Read encoder and IMU telemetry from Arduino over serial.
+    Expected line format (CSV):
+      T,left_ticks,right_ticks,gyro_z,ax,ay,az,t_ms
+    Where left/right are cumulative encoder counts, gyro_z is rad/s (or deg/s), ax/ay/az are raw accel, t_ms is millis.
+    """
+    def __init__(self, port: str = SERIAL_PORT, baud: int = SERIAL_BAUD):
+        try:
+            import serial
+        except Exception:
+            print("[WARN] pyserial not installed. Telemetry disabled. Install with: pip install pyserial")
+            self.enabled = False
+            return
+
+        self.enabled = True
+        self.port = port
+        self.baud = baud
+        try:
+            self.ser = serial.Serial(self.port, self.baud, timeout=1)
+            time.sleep(2)
+        except Exception as e:
+            print(f"[WARN] Could not open serial port {self.port}: {e}")
+            self.enabled = False
+            return
+
+        self.lock = threading.Lock()
+        self.left = 0
+        self.right = 0
+        self.gyro_z = 0.0
+        self.ax = 0.0
+        self.ay = 0.0
+        self.az = 0.0
+        self.t_ms = 0
+
+        self._last_left = None
+        self._last_right = None
+
+        self._stop = False
+        self._thread = threading.Thread(target=self._read_loop, daemon=True)
+        self._thread.start()
+
+    def _read_loop(self):
+        while not self._stop:
+            try:
+                line = self.ser.readline().decode(errors='ignore').strip()
+                if not line:
+                    continue
+                if not line.startswith('T,'):
+                    continue
+                parts = line.split(',')
+                if len(parts) < 8:
+                    continue
+                _, left_s, right_s, gyro_s, ax_s, ay_s, az_s, t_s = parts[:8]
+                with self.lock:
+                    self.left = int(left_s)
+                    self.right = int(right_s)
+                    try:
+                        self.gyro_z = float(gyro_s)
+                    except Exception:
+                        self.gyro_z = 0.0
+                    self.ax = float(ax_s)
+                    self.ay = float(ay_s)
+                    self.az = float(az_s)
+                    self.t_ms = int(t_s)
+            except Exception:
+                time.sleep(0.005)
+
+    def stop(self):
+        self._stop = True
+        try:
+            self._thread.join(timeout=0.5)
+        except Exception:
+            pass
+
+    def get_deltas(self):
+        """Return (dx_m, dtheta_rad) computed from encoder deltas since last call and reset lasts."""
+        if not self.enabled:
+            return 0.0, 0.0
+        with self.lock:
+            l = self.left
+            r = self.right
+            gz = self.gyro_z
+
+        if self._last_left is None:
+            self._last_left = l
+            self._last_right = r
+            return 0.0, 0.0
+
+        dl = l - self._last_left
+        dr = r - self._last_right
+        self._last_left = l
+        self._last_right = r
+
+        d_left_m = dl * METERS_PER_TICK
+        d_right_m = dr * METERS_PER_TICK
+        d_center = (d_left_m + d_right_m) / 2.0
+        dtheta = (d_right_m - d_left_m) / max(1e-6, WHEEL_BASE_M)
+
+        return d_center, dtheta
+
 @dataclass
 class RoverDecision:
     action: str           # FORWARD / STOP / STEER_LEFT / STEER_RIGHT
@@ -334,36 +535,49 @@ class MotorController:
             print(f"[MOTOR] Send failed: {e}")
             self._connected = False
 
+    def _send_motor_pwm(self, left_pwm: int, right_pwm: int):
+        """Send left/right PWM command to Arduino as 'M,left,right'"""
+        if self.dry_run:
+            self._log(f"MOTCMD L={left_pwm} R={right_pwm}")
+            return
+        if not self._connected:
+            return
+        cmd = f"M,{int(left_pwm)},{int(right_pwm)}"
+        self._send_command(cmd)
+
     def forward(self, speed=0.8):
         """Move forward. speed: 0.0-1.0"""
-        if self._last_action != "FORWARD":
-            pwm = int(max(0, min(255, speed * 255)))
-            self._send_command(f"F:{pwm}")
-            self._log(f"FWD {pwm}")
-            self._last_action = "FORWARD"
+        pwm = int(max(0, min(255, speed * 255)))
+        # send both sides same pwm
+        self._send_motor_pwm(pwm, pwm)
+        self._log(f"FWD {pwm}")
+        self._last_action = "FORWARD"
 
     def stop(self):
         """Stop motors."""
-        if self._last_action != "STOP":
-            self._send_command("S:0")
-            self._log("STP")
-            self._last_action = "STOP"
+        # always send stop to ensure safety
+        self._send_motor_pwm(0, 0)
+        self._log("STP")
+        self._last_action = "STOP"
 
     def steer_left(self, speed=0.6):
         """Steer left."""
-        if self._last_action != "STEER_LEFT":
-            pwm = int(max(0, min(255, speed * 255)))
-            self._send_command(f"L:{pwm}")
-            self._log(f"LFT {pwm}")
-            self._last_action = "STEER_LEFT"
+        pwm = int(max(0, min(255, speed * 255)))
+        # To steer left, reduce left and increase right
+        left_pwm = int(pwm * 0.4)
+        right_pwm = pwm
+        self._send_motor_pwm(left_pwm, right_pwm)
+        self._log(f"LFT L={left_pwm} R={right_pwm}")
+        self._last_action = "STEER_LEFT"
 
     def steer_right(self, speed=0.6):
         """Steer right."""
-        if self._last_action != "STEER_RIGHT":
-            pwm = int(max(0, min(255, speed * 255)))
-            self._send_command(f"R:{pwm}")
-            self._log(f"RGT {pwm}")
-            self._last_action = "STEER_RIGHT"
+        pwm = int(max(0, min(255, speed * 255)))
+        left_pwm = pwm
+        right_pwm = int(pwm * 0.4)
+        self._send_motor_pwm(left_pwm, right_pwm)
+        self._log(f"RGT L={left_pwm} R={right_pwm}")
+        self._last_action = "STEER_RIGHT"
     
     def close(self):
         """Close serial connection."""
@@ -974,6 +1188,25 @@ def run_live_mode(headless=False):
         return
 
     h, w = sample.shape[:2]
+    # --- Camera intrinsics (approximate) ---
+    # Replace these with calibrated values for best accuracy
+    fx = 700.0 * (w / 640.0)
+    fy = fx
+    cx = w / 2.0
+    cy = h / 2.0
+    camera_matrix = np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float64)
+    dist_coeffs = np.zeros((4, 1))
+
+    # AprilTag detector and simple EKF localizer
+    april_detector = AprilTagDetector(tag_size_m=0.15, camera_matrix=camera_matrix, dist_coeffs=dist_coeffs)
+    # Map of AprilTag IDs to world poses (x_m, y_m, theta_rad) - populate manually
+    tag_world_map = {
+        # Example: 1: (0.0, 0.0, 0.0),
+    }
+    ekf = SimpleEKFLocalizer()
+    # Serial telemetry from Arduino (encoders + IMU)
+    serial_port = SERIAL_PORT
+    telemetry = SerialTelemetry(port=serial_port, baud=SERIAL_BAUD)
     engine = DecisionEngine(w, h)
     tracker_manager = DetectionTrackerManager(max_age=MAX_AGE_FRAMES)
     frame_skipper = FrameSkipper(INFERENCE_SKIP_FRAMES)
@@ -993,6 +1226,45 @@ def run_live_mode(headless=False):
         
         frame_count += 1
         
+        # --- Read odometry / IMU deltas and predict EKF ---
+        try:
+            d_center_m, dtheta = telemetry.get_deltas() if hasattr(telemetry, 'get_deltas') else (0.0, 0.0)
+            # Convert odometry deltas to robot frame dx,dy
+            dx = d_center_m * math.cos(ekf.theta)
+            dy = d_center_m * math.sin(ekf.theta)
+            ekf.predict(dx=dx, dy=dy, dtheta=dtheta)
+        except Exception:
+            pass
+
+        # --- AprilTag detection (every frame, lightweight) ---
+        tag_detections = april_detector.detect(frame)
+        if tag_detections:
+            td = tag_detections[0]
+            tag_id = td['id']
+            rvec = td['rvec']
+            tvec = td['tvec']
+            try:
+                R_tag_cam, _ = cv2.Rodrigues(rvec)
+                T_tag_cam = np.eye(4, dtype=np.float64)
+                T_tag_cam[:3, :3] = R_tag_cam
+                T_tag_cam[:3, 3] = tvec.flatten()
+
+                if tag_id in tag_world_map:
+                    tx, ty, ttheta = tag_world_map[tag_id]
+                    T_world_tag = np.eye(4, dtype=np.float64)
+                    c = math.cos(ttheta); s = math.sin(ttheta)
+                    T_world_tag[:3, :3] = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+                    T_world_tag[0, 3] = tx
+                    T_world_tag[1, 3] = ty
+
+                    T_world_cam = T_world_tag @ T_tag_cam
+                    meas_x = float(T_world_cam[0, 3])
+                    meas_y = float(T_world_cam[1, 3])
+                    meas_theta = math.atan2(T_world_cam[1, 0], T_world_cam[0, 0])
+                    ekf.update_with_absolute_pose(meas_x, meas_y, meas_theta)
+            except Exception:
+                pass
+
         detections = []
         infer_time = 0
         
@@ -1003,6 +1275,14 @@ def run_live_mode(headless=False):
             infer_time = time.perf_counter() - t_inf
             
             raw_detections = _parse_detections(results, names)
+            # FAST STOP: immediate stop on raw detection in danger zone
+            for rd in raw_detections:
+                area_frac = rd.area / (w * h)
+                cx_norm = rd.cx / w
+                if rd.confidence >= FAST_STOP_CONF and area_frac >= FAST_STOP_AREA_FRAC and DANGER_ZONE_LEFT <= cx_norm <= DANGER_ZONE_RIGHT:
+                    print(f"[FAST STOP] Raw detection {rd.label} conf={rd.confidence:.2f} area={area_frac:.2%}")
+                    motor.stop()
+                    break
             detections = _filter_and_smooth_detections(tracker_manager, raw_detections)
         else:
             # Use interpolated detections from tracker
@@ -1045,6 +1325,14 @@ def run_live_mode(headless=False):
                             cv2.FONT_HERSHEY_SIMPLEX, 0.4, (100, 200, 100), 1, cv2.LINE_AA)
             
             draw_hud(frame, decision, actual_fps, infer_time * 1000)
+            # Fused pose from EKF
+            try:
+                px, py, ptheta = ekf.get_pose()
+                pose_text = f"POSE: {px:.2f}m {py:.2f}m {math.degrees(ptheta):.0f}deg"
+                cv2.putText(frame, pose_text, (10, h - 102),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1, cv2.LINE_AA)
+            except Exception:
+                pass
             draw_obstacle_list(frame, decision)
             
             # Show actual timing info
@@ -1164,11 +1452,14 @@ if __name__ == "__main__":
                         default="test", help="Run mode")
     parser.add_argument("--camera", type=int, default=CAMERA_INDEX,
                         help="Camera device index (default: 0)")
+    parser.add_argument("--serial", type=str, default=SERIAL_PORT,
+                        help="Serial port for Arduino telemetry/commands")
     parser.add_argument("--headless", action="store_true",
                         help="Live mode without display window")
     args = parser.parse_args()
 
     CAMERA_INDEX = args.camera
+    SERIAL_PORT = args.serial
 
     if args.mode == "test":
         run_test_mode()
