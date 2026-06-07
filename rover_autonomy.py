@@ -890,7 +890,7 @@ class CameraManager:
         """Find all available camera devices."""
         self.available_cameras = []
         for idx in range(max_index):
-            cap = cv2.VideoCapture(idx)
+            cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
             if cap.isOpened():
                 ret, frame = cap.read()
                 if ret and frame is not None:
@@ -901,6 +901,9 @@ class CameraManager:
                         'name': f"Camera {idx}"
                     })
                 cap.release()
+        # Give the OS a moment to fully release devices before we reopen them
+        if self.available_cameras:
+            time.sleep(0.3)
     
     def get_available_cameras(self) -> list[dict]:
         """Return list of available cameras."""
@@ -932,7 +935,7 @@ class CameraManager:
         
         self.current_camera = index
         self.main_camera_index = index
-        self.cap = cv2.VideoCapture(index)
+        self.cap = cv2.VideoCapture(index, cv2.CAP_V4L2)
         
         if not self.cap.isOpened():
             print(f"[ERROR] Failed to open camera {index}")
@@ -948,7 +951,17 @@ class CameraManager:
             self._frame_buffer = None
             self._capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
             self._capture_thread.start()
-        
+
+            # Wait for the thread to capture the first frame (up to 3 s)
+            deadline = time.time() + 3.0
+            while time.time() < deadline:
+                with self._frame_lock:
+                    if self._frame_buffer is not None:
+                        break
+                time.sleep(0.05)
+            else:
+                print(f"[WARN] Camera {index} opened but no frames received within 3s")
+
         print(f"[OK] Switched to camera {index}")
         return True
     
@@ -960,13 +973,14 @@ class CameraManager:
         """Read a frame from current camera."""
         if self.cap is None:
             return False, None
-        
-        if self.use_threading and self._frame_buffer is not None:
+
+        if self.use_threading:
+            # Only the background thread reads from self.cap — reading here too
+            # causes a race condition that silently breaks capture on RPi.
             with self._frame_lock:
                 frame = self._frame_buffer
             return frame is not None, frame
         else:
-            # Fallback to synchronous read
             return self.cap.read()
     
     def release(self) -> None:
@@ -990,7 +1004,7 @@ class CameraManager:
 
 
 def check_camera(index: int) -> tuple[bool, str]:
-    cap = cv2.VideoCapture(index)
+    cap = cv2.VideoCapture(index, cv2.CAP_V4L2)
     if not cap.isOpened():
         return False, f"Camera index {index} not found"
     ret, frame = cap.read()
@@ -1077,7 +1091,7 @@ def run_test_mode():
 
     # 3. Single inference
     print("[3/4] Running inference on live frame...")
-    cap = cv2.VideoCapture(CAMERA_INDEX)
+    cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_V4L2)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAPTURE_WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAPTURE_HEIGHT)
     ret, frame = cap.read()
@@ -1103,7 +1117,7 @@ def run_test_mode():
 
     # 4. FPS estimate (50 frames)
     print("[4/4] Estimating FPS with frame skipping (50 frames)...")
-    cap = cv2.VideoCapture(CAMERA_INDEX)
+    cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_V4L2)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAPTURE_WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAPTURE_HEIGHT)
     times = []
